@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
+import os
 import torch
 import math
 from .. import SparseTensor
@@ -179,10 +180,59 @@ def sparse_windowed_scaled_dot_product_self_attention(
             )  # [M, H, C]
         elif ATTN == "sdpa":
             q, k, v = qkv_feats.unbind(dim=1)
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-            out = masked_sdpa(q, k, v, seq_lens, seq_lens)
+            if (os.environ.get("SAM3D_ATTN_IMPL") == "flash"
+                    and q.device.type == "mps" and q.dtype == torch.float16):
+                # GenIA speed test (Nov 25, 2026): mtlattn varlen kernel
+                # serves the packed windowed self-attention directly
+                # (fp32 accumulation, differentiable). The kernel is
+                # forced so inference-mode (anchor) decodes do not fall
+                # back to mtlattn's per-seq native-SDPA routing.
+                import mtlattn
+
+                os.environ["MTLATTN_FORCE_KERNEL"] = "1"
+                cu_seqlens = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32, device=q.device),
+                        torch.cumsum(
+                            torch.tensor(seq_lens, dtype=torch.int32,
+                                         device=q.device),
+                            dim=0,
+                        ),
+                    ]
+                )
+                out = mtlattn.varlen_attention(
+                    q, k, v, cu_seqlens, cu_seqlens, max(seq_lens)
+                )
+            elif (os.environ.get("SAM3D_ATTN_IMPL") == "flash32"
+                    and q.device.type == "mps" and q.dtype == torch.float16):
+                # GenIA speed test (Nov 25, 2026): fp32-input variant of
+                # the mtlattn branch above - q/k/v upcast to fp32 for
+                # the kernel call, output cast back to fp16 (mirrors
+                # flash_bench.py arm_mtl_fp32). Same call site and
+                # gating; segment-tested against the noise floor for
+                # the adoption decision.
+                import mtlattn
+
+                os.environ["MTLATTN_FORCE_KERNEL"] = "1"
+                cu_seqlens = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32, device=q.device),
+                        torch.cumsum(
+                            torch.tensor(seq_lens, dtype=torch.int32,
+                                         device=q.device),
+                            dim=0,
+                        ),
+                    ]
+                )
+                out = mtlattn.varlen_attention(
+                    q.float(), k.float(), v.float(),
+                    cu_seqlens, cu_seqlens, max(seq_lens)
+                ).to(q.dtype)
+            else:
+                q = q.unsqueeze(0)
+                k = k.unsqueeze(0)
+                v = v.unsqueeze(0)
+                out = masked_sdpa(q, k, v, seq_lens, seq_lens)
 
     out = out[bwd_indices]  # [T, H, C]
 
